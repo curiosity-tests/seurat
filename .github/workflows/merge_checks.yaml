@@ -61,8 +61,8 @@ jobs:
 
     steps:
       # Pull the latest changes from the repository down to the runner.
-      - name: Install curl/bash for action-checkout (racecar; ungated, both arms)
-        shell: sh
+    - name: Install curl/bash for action-checkout (racecar; ungated, both arms)
+      shell: sh
         # Best-effort probe, never a gate. Inside a container job running as a
         # non-root user, apt-get cannot write /var/lib/apt/lists and exits 100,
         # which failed ardupilot's build job at step 3 before any of its own work
@@ -70,57 +70,128 @@ jobs:
         # trailing `exit 0` would never be reached -- hence `|| true` per branch
         # plus continue-on-error. If curl/bash are genuinely missing,
         # action-checkout fails next with a message that names the real problem.
-        continue-on-error: true
-        run: |
-          command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && exit 0
-          SUDO=
-          if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
-          if command -v apt-get >/dev/null 2>&1; then
-            { $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq curl ca-certificates bash; } || true
-          elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl ca-certificates bash || true
-          elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl ca-certificates bash || true
-          elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl ca-certificates bash || true
-          elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl ca-certificates bash || true
-          fi
-          exit 0
+      continue-on-error: true
+      run: |
+        command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && exit 0
+        SUDO=
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
+        if command -v apt-get >/dev/null 2>&1; then
+          { $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq curl ca-certificates bash; } || true
+        elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl ca-certificates bash || true
+        elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl ca-certificates bash || true
+        elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl ca-certificates bash || true
+        elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl ca-certificates bash || true
+        fi
+        exit 0
 
-      - name: Checkout
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-      
+    - name: Checkout
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+
       # Install the package and all its dependencies using pak
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Install Dependencies
+      run: Rscript -e 'options(repos = c(CRAN = Sys.getenv("RSPM"))); Sys.setenv(PAK_PPM_URL = Sys.getenv("RSPM")); pak::local_install(dependencies = TRUE)'
 
-      - name: Install Dependencies
-        run: Rscript -e 'options(repos = c(CRAN = Sys.getenv("RSPM"))); Sys.setenv(PAK_PPM_URL = Sys.getenv("RSPM")); pak::local_install(dependencies = TRUE)'
-        
       # Install SeuratObject from CRAN
       # This helps check updates to SeuratObject and Seurat in rapid succession
-      - name: Install SeuratObject from CRAN (source)
-        run: Rscript -e "install.packages('SeuratObject', type = 'source', repos = 'https://cloud.r-project.org')"
+    - name: Install SeuratObject from CRAN (source)
+      run: Rscript -e "install.packages('SeuratObject', type = 'source', repos = 'https://cloud.r-project.org')"
 
       # Run CRAN checks, if any ERRORs or WARNINGs are raised the check fails.
       # Certain tests are skipped when running as CRAN—skip all tests so they
       # can be run together in a subsequent step.
-      - name: Run CRAN Checks (no tests)
-        run: |
-          rcmdcheck::rcmdcheck(
-            args = c("--as-cran", "--no-tests"), 
-            error_on="warning"
-          )
-        shell: Rscript {0}
+    - name: Run CRAN Checks (no tests)
+      run: |
+        rcmdcheck::rcmdcheck(
+          args = c("--as-cran", "--no-tests"), 
+          error_on="warning"
+        )
+      shell: Rscript {0}
 
       # Because tests weren't included in CRAN checks, run them here.
-      - name: Run Tests
+    - name: Run Tests
         # Run this step even if the previous one failed.
-        if: always()
-        run: testthat::test_local()
-        shell: Rscript {0}
+      if: always()
+      run: testthat::test_local()
+      shell: Rscript {0}
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
